@@ -142,6 +142,10 @@ logger.info("=" * 80)
 # mcp = FastMCP("Azure Entra ID Protected MCP Server (JWTVerifier)", auth=auth)
 mcp = FastMCP("Azure Entra ID Protected MCP Server (JWTVerifier)")
 
+# OBOトークンのキャッシュ用グローバル変数（ユーザーIDをキーにした辞書）
+# {user_oid: (token, expires_at)}
+_cached_obo_tokens: dict[str, tuple[str, int]] = {}
+
 
 @mcp.tool()
 def secure_ping() -> dict:
@@ -366,6 +370,25 @@ async def get_azure_blob_storage_token(ctx: Context) -> dict:
                 "message": "Authorization header with Bearer token is required",
             }
         
+        # 委任アクセストークンからユーザーOID（Object ID）を取得
+        try:
+            delegated_decoded = jwt.decode(delegated_token, options={"verify_signature": False})
+            user_oid = delegated_decoded.get("oid")
+            if not user_oid:
+                return {
+                    "ok": False,
+                    "error": "No user OID found in token",
+                    "message": "Token must contain 'oid' claim",
+                }
+            logger.info(f"✅ User OID extracted from delegated token: {user_oid}")
+        except Exception as e:
+            logger.error(f"❌ Failed to decode delegated token: {e}")
+            return {
+                "ok": False,
+                "error": "Invalid delegated token",
+                "message": str(e),
+            }
+        
         # OBO フローで Azure Blob Storage 用のアクセストークンを取得
         # resource_uri は基本 URI のみを指定 (/.default は自動的に追加される)
         # TARGET_AUDIENCES から最初のリソースを使用
@@ -398,6 +421,12 @@ async def get_azure_blob_storage_token(ctx: Context) -> dict:
         logger.info("✅ Azure Blob Storage OBO token acquired successfully")
         logger.info(f"  Audience: {decoded_obo_token.get('aud')}")
         logger.info(f"  Scopes: {decoded_obo_token.get('scp', decoded_obo_token.get('roles'))}")
+        
+        # グローバル辞書にOBOトークンをキャッシュ（ユーザーoidをキー、有効期限も保存）
+        global _cached_obo_tokens
+        expires_at = decoded_obo_token.get('exp', int(time.time()) + 3600)  # デフォルト1時間
+        _cached_obo_tokens[user_oid] = (obo_token, expires_at)
+        logger.info(f"💾 OBO token cached for user {user_oid} (expires at: {_format_unix_ts_jst(expires_at)} JST)")
         
         return {
             "ok": True,
@@ -456,34 +485,72 @@ async def read_blob_with_token(
 
     container = AZURE_STORAGE_CONTAINER
 
-    # Authorization ヘッダーから Access Token を取得
+    # トークンの取得: ユーザーごとのキャッシュされたOBOトークンを優先、なければAuthorizationヘッダーから取得
     token = None
+    token_source = None
+    user_oid = None
+    
+    # まず、Authorizationヘッダーまたはキャッシュからユーザーoidを特定する必要がある
+    # Authorizationヘッダーから委任トークンを取得してoidを抽出
     if ctx and hasattr(ctx, 'request_context') and ctx.request_context:
         request = ctx.request_context.request
         auth_header = request.headers.get("Authorization", "")
         
         if auth_header.startswith("Bearer "):
-            token = auth_header.split(" ", 1)[1]
-            logger.info(f"✅ Access token extracted from Authorization header (length: {len(token)})")
-            
-            # トークンの中身をデコードして表示
+            header_token = auth_header.split(" ", 1)[1]
             try:
-                decoded = jwt.decode(token, options={"verify_signature": False})
-                logger.info("✅ Access token claims decoded:⭐⭐⭐")
-                for key, value in decoded.items():
-                    logger.info(f"  {key}: {value}")
-
-                # 主要な時刻クレームは日本時間も表示
-                _log_time_claims(decoded, label="access")
-                logger.info("=" * 80)
-            except Exception as decode_ex:
-                logger.warning(f"⚠️ Failed to decode token: {decode_ex}")
+                # トークンからユーザーoidを取得
+                decoded_header = jwt.decode(header_token, options={"verify_signature": False})
+                user_oid = decoded_header.get("oid")
+                logger.info(f"✅ User OID extracted from Authorization header: {user_oid}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to decode token from Authorization header: {e}")
+    
+    # 1. ユーザーoidが特定できた場合、キャッシュをチェック
+    global _cached_obo_tokens
+    if user_oid and user_oid in _cached_obo_tokens:
+        cached_token, expires_at = _cached_obo_tokens[user_oid]
+        current_time = int(time.time())
+        
+        # 有効期限をチェック（5分のバッファを設ける）
+        if current_time < (expires_at - 300):
+            token = cached_token
+            token_source = "cached_obo_token"
+            logger.info(f"✅ Using cached OBO token for user {user_oid} (expires at: {_format_unix_ts_jst(expires_at)} JST)")
+        else:
+            # 期限切れのトークンを削除
+            del _cached_obo_tokens[user_oid]
+            logger.warning(f"⚠️ Cached OBO token for user {user_oid} has expired, removed from cache")
+    
+    # 2. キャッシュにトークンがない、または期限切れの場合、Authorizationヘッダーから取得
+    if not token and ctx and hasattr(ctx, 'request_context') and ctx.request_context:
+        request = ctx.request_context.request
+        auth_header = request.headers.get("Authorization", "")
+        
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1]
+            token_source = "authorization_header"
+            logger.info(f"✅ Access token extracted from Authorization header (length: {len(token)})")
         else:
             logger.error("❌ Authorization header with Bearer token is required")
             return {"error": "Authorization header with Bearer token is required"}
     else:
-        logger.error("❌ Request context not available")
-        return {"error": "Request context not available"}
+        logger.error("❌ No token available (no cached OBO token and no request context)")
+        return {"error": "No token available"}
+    
+    # トークンの中身をデコードして表示
+    if token:
+        try:
+            decoded = jwt.decode(token, options={"verify_signature": False})
+            logger.info(f"✅ Access token claims decoded (source: {token_source}):⭐⭐⭐")
+            for key, value in decoded.items():
+                logger.info(f"  {key}: {value}")
+
+            # 主要な時刻クレームは日本時間も表示
+            _log_time_claims(decoded, label="access")
+            logger.info("=" * 80)
+        except Exception as decode_ex:
+            logger.warning(f"⚠️ Failed to decode token: {decode_ex}")
 
     # TokenCredential としてラップ
     credential = SimpleTokenCredential(token)
